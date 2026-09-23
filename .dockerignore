@@ -15,3 +15,6 @@ dotnet/**/obj
 *.png
 *.pdf
 *.log
+**/node_modules
+!office-addin/assets/icon-32.png
+!office-addin/assets/icon-64.png

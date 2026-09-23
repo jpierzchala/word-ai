@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="TaskPaneApp">
+  <Id>d9a54e63-a71e-4cc5-87dd-dc6555d60a5b</Id>
+  <Version>2.0.0.0</Version>
+  <ProviderName>Word AI local fork</ProviderName>
+  <DefaultLocale>pl-PL</DefaultLocale>
+  <DisplayName DefaultValue="Word AI Secure Live"/>
+  <Description DefaultValue="Live Word editing with revocable document-session access for Codex and Claude Code."/>
+  <IconUrl DefaultValue="https://localhost:3100/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://localhost:3100/icon-64.png"/>
+  <SupportUrl DefaultValue="https://localhost:3100"/>
+  <AppDomains><AppDomain>https://localhost:3100</AppDomain></AppDomains>
+  <Hosts><Host Name="Document"/></Hosts>
+  <Requirements><Sets DefaultMinVersion="1.6"><Set Name="WordApi"/></Sets></Requirements>
+  <DefaultSettings><SourceLocation DefaultValue="https://localhost:3100/taskpane.html"/></DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+</OfficeApp>

@@ -9,11 +9,12 @@
     "start": "office-addin-debugging start manifest.xml",
     "stop": "office-addin-debugging stop manifest.xml"
   },
+  "overrides": {"adm-zip": "0.6.1"},
   "devDependencies": {
-    "@types/office-js": "latest",
-    "office-addin-debugging": "latest",
-    "office-addin-dev-certs": "latest",
-    "office-addin-manifest": "^2.1.5",
-    "typescript": "latest"
+    "@types/office-js": "1.0.609",
+    "office-addin-debugging": "7.0.0",
+    "office-addin-dev-certs": "3.0.0",
+    "office-addin-manifest": "3.0.0",
+    "typescript": "7.0.2"
   }
 }

@@ -105,5 +105,5 @@ jobs:
       - name: Validate Office manifest
         run: npx office-addin-manifest validate manifest.xml
 
-      - name: Production dependency audit
-        run: npm audit --omit=dev --registry=https://registry.npmjs.org --audit-level=high
+      - name: All dependency audit (including the development web server)
+        run: npm audit --registry=https://registry.npmjs.org --audit-level=high

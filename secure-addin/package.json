@@ -1,0 +1,7 @@
+{
+  "name": "word-ai-secure-live-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {"test": "node --test tests/*.test.js"},
+  "devDependencies": {"@xmldom/xmldom": "0.9.12"}
+}

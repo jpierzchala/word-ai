@@ -34,6 +34,7 @@ dotnet/**/obj/
 
 # Word AI local sidecars and generated verification artifacts
 .wordai/
+/.mcp.json
 examples/.wordai/
 examples/*.edited.docx
 examples/*.edited.audit.json

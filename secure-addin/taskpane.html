@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Word AI — dostęp do dokumentu</title><link rel="stylesheet" href="/taskpane.css">
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<script type="module" src="/taskpane.js"></script></head>
+<body><h1>Word AI</h1><p>Pracuj nad otwartym dokumentem z Codexem lub Claude Code.</p>
+<p>Kliknięcie przycisku udostępnia agentom <strong>cały ten dokument do odczytu i wykonywania zleconych zmian</strong> — bez osobnego zatwierdzania każdej zmiany. Tekst odczytany przez agenta trafia do jego usługi modelowej.</p>
+<button id="connect">Udostępnij dokument AI</button>
+<button id="disconnect" disabled>Cofnij dostęp</button>
+<h2 id="access">Brak dostępu</h2><p id="document"></p>
+<p id="status" role="status">Uruchamianie Worda…</p><p id="last-change"></p>
+<details><summary>Jak to działa?</summary><p>Zapisz dokument, udostępnij go i napisz agentowi, co ma zrobić. Nie zaznaczasz fragmentów i nie wklejasz tokena. Agent znajduje właściwe akapity, przygotowuje zmianę i sprawdza wynik.</p>
+<p>Dostęp wygasa po rozłączeniu, zmianie tożsamości dokumentu lub restarcie mostka. Cofnięcie dostępu zatrzymuje kolejne operacje; zapis wysłany już do Worda może się zakończyć.</p>
+<p>Obsługiwane są tekst akapitów i komórek tabel, dodawanie i usuwanie akapitów, pogrubienie, kursywa i podkreślenie fragmentu, listy (numeracja od 1, typ, poziom), dodawanie wierszy tabel, przenoszenie sekcji z podsekcjami, tabelami i obrazami, obrazy PNG/JPEG z podpisem oraz style wbudowane. Obiekty złożone, pola, komentarze i rewizje są chronione. Profil nie przebudowuje całego dokumentu. Unikaj równoczesnej edycji tego samego akapitu.</p></details>
+</body></html>

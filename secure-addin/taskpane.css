@@ -1,0 +1,12 @@
+body { font: 14px/1.5 system-ui, sans-serif; padding: 12px; color: #17212b; background: #fff; color-scheme: light; }
+h1 { font-size: 20px; } h2 { font-size: 18px; }
+fieldset { border: 1px solid #aab4bf; margin: 12px 0; padding: 10px; }
+label { display: block; margin: 8px 0; overflow-wrap: anywhere; }
+input[type=password] { width: 95%; } button { padding: 8px; margin: 4px; cursor: pointer; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; background: #edf2f7; }
+#document, #target { overflow-wrap: anywhere; white-space: pre-wrap; }
+#approval { border: 2px solid #276192; padding: 12px; } #status { font-weight: 600; }
+[hidden] { display: none !important; }
+#connect { background: #165a91; color: white; border: 0; border-radius: 5px; }
+button:disabled { opacity: .55; cursor: default; }
+#last-change { padding: 8px 0; border-top: 1px solid #cbd5df; }

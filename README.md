@@ -1,5 +1,11 @@
 # Word AI
 
+> **This fork:** the default Docker image runs the isolated **secure-live** profile.
+> Start with [the local secure-live guide](docs/SECURE-LIVE.md). Only that profile is
+> covered by the hardening work. The legacy CLI, HTTP bridge, launchers and offline
+> tools described below are retained as upstream source and are **not part of this
+> deployment or its security claims**. Do not use legacy quickstart for this setup.
+
 <!-- mcp-name: io.github.flyfish-dev/word-ai -->
 
 | Language | Preview |
