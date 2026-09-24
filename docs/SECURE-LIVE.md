@@ -72,9 +72,8 @@ trzynastu nazw `mcp__word_ai_secure__...`; inne pozwolenia i ustawienia modeli z
 Gdy przebudowa zamknie transport, odśwież połączenie MCP w kliencie. Zapis konfiguracji
 nie jest dowodem przeładowania narzędzi w już trwającej rozmowie.
 
-Canonical skill: `C:/BI Git/bi-shared/.claude/skills/word-live/SKILL.md`.
-Globalne junctiony `~/.claude/skills/word-live` i `~/.agents/skills/word-live` wskazują
-ten sam katalog. Aktywacja: `/word-live` w Claude Code, `$word-live` lub naturalna
+Canonical skill: `~/.claude/skills/word-live/SKILL.md` (globalny skill użytkownika, poza
+repozytoriami). Junction `~/.agents/skills/word-live` wskazuje ten sam katalog dla Codexa. Aktywacja: `/word-live` w Claude Code, `$word-live` lub naturalna
 prośba o pracę w otwartym Wordzie w Codexie. Koszt always-on: nazwa/opis skilla
 oraz trzynaście schematów MCP; pełna instrukcja jest czytana na żądanie. Bez nowego modelu,
 harmonogramu ani zmian zespołowych ustawień runtime.
