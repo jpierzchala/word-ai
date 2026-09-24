@@ -54,6 +54,28 @@ class StructureTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=(operation, text, find)):
                 self.edit(operation, text, find)
 
+    def restart_apply(self, request_id, result):
+        preview = self.finish(self.edit("list_restart"), {"ok": True, "ooxml_sha256": "a" * 64, "guard_sha256": "d" * 64,
+                                                          "method": "start_override"})
+        applied = self.call("apply", preview_id=preview["result"]["preview_id"], request_id=request_id)
+        return self.finish(applied, result)
+
+    def test_word_refusal_verified_unchanged_is_failed_and_keeps_the_session(self):
+        refused = self.restart_apply("restart-1", {"ok": False, "submitted": True, "unchanged": True,
+                                                   "error": "Word odrzucił zmianę listy: This command is not available."})
+        self.assertEqual(refused["status"], "failed")
+        self.assertTrue(refused["result"]["unchanged"])
+        # Only a literal true counts; any other value keeps the outcome unknown and blocks the session.
+        for request_id, flag in [("restart-2", "true"), ("restart-3", False)]:
+            state = self.restart_apply(request_id, {"ok": False, "submitted": True, "unchanged": flag, "error": "x"})
+            self.assertEqual(state["status"], "unknown", flag)
+            for command in self.state.commands.values():
+                if command["status"] == "unknown":
+                    command["status"] = "failed"
+        self.restart_apply("restart-4", {"ok": False, "submitted": True, "error": "verification"})
+        with self.assertRaisesRegex(ValueError, "Unknown outcome"):
+            self.edit("list_restart")
+
     def test_move_requires_discovered_distinct_anchors_and_hashes(self):
         for changes in [{"target_paragraph_id": "undiscovered"}, {"paragraph_id": "undiscovered"}, {"target_paragraph_id": HEADING},
                         {"target_expected_sha256": "stale"}, {"expected_sha256": "B" * 64}, {"position": "inside"}]:

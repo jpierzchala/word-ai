@@ -1,7 +1,8 @@
 // Office.js execution for structural operations. Each operation re-derives its
 // plan on apply and must match the preview's structural guard before writing.
 import {W, canonicalNode, digest} from "./safety.js";
-import {paragraphDigest, planDeleteParagraph, planFormat, planList, planTableRow, searchText} from "./document-edit.js";
+import {firstOfLevel, levelStart, paragraphDigest, planDeleteParagraph, planFormat, planList, planTableRow, restartOutcome, restartPackage,
+  restartRun, searchText} from "./document-edit.js";
 import {BOOKMARK_NAME, compareSequence, emptyParagraphShape, emptyParagraphXml, expectedSequence, findSection, headingLevel, inspectSection,
   preparePackage, resolveDestination, sectionDigest, startsInsideField} from "./section-move.js";
 
@@ -120,10 +121,11 @@ async function formatText(current, payload, mode, env) {
 // List.paragraphs can return other lists' paragraphs on Win32 (Office.js #6602),
 // and List.id is not guaranteed stable across writes, so membership is read
 // per paragraph and checks across a write compare paragraph IDs.
-async function listState(current, payload) {
+// values: also read every item's rendered number (WordApiDesktop 1.3).
+async function listState(current, payload, values = false) {
   const {ctx} = current;
-  // Fresh proxies on every read: after separateList a cached List object may
-  // still be the list the paragraph left.
+  // Fresh proxies on every read: after a write a cached List object may still
+  // describe the paragraph's former list.
   const paragraph = ctx.document.getParagraphByUniqueLocalId(payload.paragraph_id);
   const item = paragraph.listItemOrNullObject, list = paragraph.listOrNullObject;
   item.load("isNullObject,level,listString");
@@ -132,7 +134,8 @@ async function listState(current, payload) {
   paragraphs.load("items/uniqueLocalId,items/text,items/isListItem");
   const lists = ctx.document.body.lists;
   lists.load("items/id,items/levelTypes");
-  const format = Office.context.requirements.isSetSupported("WordApiDesktop", "1.3") ? paragraph.getRange("Content").listFormat : null;
+  const desktop = Office.context.requirements.isSetSupported("WordApiDesktop", "1.3");
+  const format = desktop ? paragraph.getRange("Content").listFormat : null;
   if (format) format.load("listValue");
   await ctx.sync();
   if (item.isNullObject || list.isNullObject) return {isListItem: false};
@@ -140,49 +143,136 @@ async function listState(current, payload) {
     const l = p.listOrNullObject, i = p.listItemOrNullObject;
     l.load("isNullObject,id");
     i.load("isNullObject,level,listString");
-    return {p, l, i};
+    const f = values && desktop ? p.getRange("Content").listFormat : null;
+    if (f) f.load("listValue");
+    return {p, l, i, f};
   });
   await ctx.sync();
   const all = candidates.filter(x => !x.l.isNullObject && !x.i.isNullObject).map(x => ({id: x.p.uniqueLocalId,
-    list: x.l.id, text: x.p.text, level: x.i.level, listString: x.i.listString}));
+    list: x.l.id, text: x.p.text, level: x.i.level, listString: x.i.listString, value: x.f ? x.f.listValue : null}));
   const items = all.filter(x => x.list === list.id).map(({list: _, ...x}) => x);
   return {isListItem: true, paragraph, item, list, id: list.id, level: item.level, listString: item.listString,
     levelTypes: list.levelTypes, items, all, index: items.findIndex(i => i.id === payload.paragraph_id),
-    value: format ? format.listValue : null, canSeparate: Office.context.requirements.isSetSupported("WordApiDesktop", "1.4"),
+    value: format ? format.listValue : null, sequence: paragraphs.items.map(p => [p.uniqueLocalId, p.text]),
     others: lists.items.filter(l => l.id !== list.id).map(l => JSON.stringify(l.levelTypes)).sort()};
+}
+
+// A restart needs the item's Whole export (Content exports omit its w:pPr and
+// numbering). Level 0 also exports the span from the item to the body's last
+// list paragraph: the run it renumbers can reach later Office.js lists.
+async function restartPlan(current, state) {
+  if (!state.isListItem || state.index < 0 || (state.level !== 0 && !firstOfLevel(state))) return null;
+  if (current.paragraph.tableNestingLevel > 0) return {reason: "element listy leży w tabeli"};
+  const {ctx} = current;
+  const whole = state.paragraph.getRange("Whole").getOoxml();
+  const target = state.all.findIndex(x => x.id === state.items[state.index].id);
+  const last = ctx.document.getParagraphByUniqueLocalId(state.all[state.all.length - 1].id);
+  const span = state.level === 0 ? state.paragraph.getRange("Whole").expandTo(last.getRange("Whole")).getOoxml() : null;
+  try { await ctx.sync(); }
+  catch (error) { return {reason: `eksport akapitu nie powiódł się (${error.message})`}; }
+  try {
+    if (state.level !== 0) return {levelStart: levelStart(whole.value, state.level, DOMParser, current.text)};
+    const {run, sharesInstance} = restartRun(span.value, state.all, target, state.level);
+    return {whole: whole.value, package: restartPackage(whole.value, state.level, DOMParser, XMLSerializer, current.text), run, sharesInstance};
+  } catch (error) { return {reason: error.message}; }
+}
+
+// The run's items and their numbers belong to the guard: they lie outside the item's Office.js list.
+const listGuard = (payload, hash, state, restart, method) => guardOf([payload.operation, hash, state.levelTypes, state.items,
+  state.others, restart?.package?.shape ?? null, restart?.run ? restart.run.map(id => [id, state.all.find(x => x.id === id)?.value]) : null,
+  restart?.sharesInstance ?? null, restart?.levelStart ?? null, method ?? null]);
+// List ids are not stable across writes; compare by paragraph.
+const numbersOf = state => state.isListItem ? [state.value, state.all.map(x => [x.id, x.text, x.level, x.listString, x.value])] : null;
+const shapeOf = (xml, level, text) => { try { return restartPackage(xml, level, DOMParser, XMLSerializer, text).shape; } catch { return null; } };
+
+// Word rejected the write batch. A fresh read equal to the preview (same guard,
+// same numbers of every list item, same paragraphs) proves nothing was written:
+// that is a plain failure, not an unknown outcome. Any doubt leaves it unknown.
+async function refusal(error, current, payload, state, plan) {
+  try {
+    const fresh = current.ctx.document.getParagraphByUniqueLocalId(payload.paragraph_id).getRange("Content").getOoxml();
+    await current.ctx.sync();
+    const now = await listState(current, payload, payload.operation === "list_restart");
+    const restart = payload.operation === "list_restart" ? await restartPlan(current, now) : null;
+    if (JSON.stringify(numbersOf(now)) === JSON.stringify(numbersOf(state)) && JSON.stringify(now.sequence) === JSON.stringify(state.sequence) &&
+        await listGuard(payload, await paragraphDigest(fresh.value), now, restart, plan.method) === payload.guard_sha256) {
+      error.unchanged = true;
+      error.message = `Word odrzucił zmianę listy: ${error.message} Kontrola po błędzie potwierdziła, że dokument się nie zmienił.`;
+    }
+  } catch { /* the state cannot be confirmed */ }
+  return error;
 }
 
 async function listChange(current, payload, mode, env) {
   const {ctx} = current;
-  const state = await listState(current, payload);
-  const plan = planList(current, payload, state);
-  const guard = await guardOf([payload.operation, current.hash, state.levelTypes, state.items, state.others]);
+  const restarting = payload.operation === "list_restart";
+  const state = await listState(current, payload, restarting);
+  const restart = restarting ? await restartPlan(current, state) : null;
+  const plan = planList(current, payload, state, restart);
+  const guard = await listGuard(payload, current.hash, state, restart, plan.method);
   if (mode === "preview") return {ok: true, ...plan, guard_sha256: guard};
   if (guard !== payload.guard_sha256) throw stale();
   await env.beforeWrite();
-  env.submitted();
-  if (payload.operation === "list_level") state.item.level = plan.new_level;
-  else if (payload.operation === "list_type") {
-    if (plan.new_type === "bullet") state.list.setLevelBullet(state.level, "Solid");
-    else state.list.setLevelNumbering(state.level, "Arabic", [state.level, "."]);
-  } else if (plan.method === "set_starting_number") state.list.setLevelStartingNumber(state.level, 1);
-  else state.paragraph.separateList();
-  await ctx.sync();
-  let after = await listState(current, payload);
-  if (plan.method === "separate_list" && after.isListItem && after.value !== null && after.value !== 1) {
-    // The separated list restarts at its level's starting number; make it 1,
-    // but only on a list that no longer contains the earlier items.
-    const earlier = new Set(state.items.slice(0, state.index).map(i => i.id));
-    if (after.items.some(i => earlier.has(i.id))) throw Error("Word nie rozdzielił listy. Sprawdź dokument (Ctrl+Z cofa zmianę).");
-    await env.beforeFollowUp();
-    after.list.setLevelStartingNumber(after.level, 1);
+  if (plan.method === "start_override") {
+    // The package carries the item's w:pPr, which the Content hash in
+    // beforeWrite cannot see: re-read it right before the write.
+    const fresh = state.paragraph.getRange("Whole").getOoxml();
     await ctx.sync();
-    after = await listState(current, payload);
+    if (shapeOf(fresh.value, state.level, current.text) !== restart.package.shape) throw stale();
   }
+  env.submitted();
+  let committed = null;
+  try {
+    if (payload.operation === "list_level") state.item.level = plan.new_level;
+    else if (payload.operation === "list_type") {
+      if (plan.new_type === "bullet") state.list.setLevelBullet(state.level, "Solid");
+      else state.list.setLevelNumbering(state.level, "Arabic", [state.level, "."]);
+    } else if (plan.method === "set_starting_number") state.list.setLevelStartingNumber(state.level, 1);
+    else {
+      // Exported in the same batch, immediately before the insertion.
+      committed = state.paragraph.getRange("Whole").getOoxml();
+      state.paragraph.getRange("Content").insertOoxml(restart.package.xml, "End");
+    }
+    await ctx.sync();
+  } catch (error) { throw await refusal(error, current, payload, state, plan); }
+  const failed = what => Error(`Weryfikacja listy nie powiodła się (${what}). Sprawdź dokument (Ctrl+Z cofa zmianę).`);
+  // The item's paragraph after the write; start_override gives it a new ID.
+  let target = payload.paragraph_id;
+  if (plan.method === "start_override") {
+    // Expected split: the item's text in a new paragraph ending with the
+    // package's mark, its former mark and ID on an empty paragraph right after,
+    // everything else as before. Only that empty paragraph is removed.
+    const split = ctx.document.body.paragraphs;
+    split.load("items/uniqueLocalId,items/text");
+    await ctx.sync();
+    const rows = split.items.map(p => [p.uniqueLocalId, p.text]), at = state.sequence.findIndex(([id]) => id === payload.paragraph_id);
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    if (at < 0 || rows.length !== state.sequence.length + 1 || !same(rows[at + 1], [payload.paragraph_id, ""]) ||
+        rows[at][1] !== state.sequence[at][1] || rows[at][0] === payload.paragraph_id ||
+        !same([...rows.slice(0, at), ...rows.slice(at + 2)], [...state.sequence.slice(0, at), ...state.sequence.slice(at + 1)]))
+      throw failed("układ akapitów po wstawieniu");
+    target = rows[at][0];
+    await env.beforeFollowUp();
+    // Read in the same batch, before the deletion: anything typed into the
+    // paragraph meanwhile makes the outcome unknown instead of silently lost.
+    const empty = ctx.document.getParagraphByUniqueLocalId(payload.paragraph_id);
+    empty.load("text");
+    const pictures = empty.getRange("Whole").inlinePictures;
+    pictures.load("items");
+    empty.delete();
+    await ctx.sync();
+    if (empty.text !== "" || pictures.items.length) throw failed("pusty akapit zmienił się przed usunięciem");
+  }
+  const afterWrite = async () => {
+    try { return await listState(current, {...payload, paragraph_id: target}, restarting); }
+    catch (error) { throw failed(error.message); }
+  };
+  const after = await afterWrite();
   const problems = [];
+  const run = new Set(plan.method === "start_override" ? restart.run : []);
   const before = new Map(state.all.map(x => [x.id, x]));
   const now = new Map(after.isListItem ? after.all.map(x => [x.id, x]) : []);
-  const self = now.get(payload.paragraph_id);
+  const self = now.get(target);
   if (!after.isListItem || !self) problems.push("akapit przestał być elementem listy");
   else {
     if (self.text !== before.get(payload.paragraph_id)?.text) problems.push("tekst akapitu");
@@ -197,13 +287,30 @@ async function listChange(current, payload, mode, env) {
       if (after.value !== null ? after.value !== 1 : !/^\D*1\D*$/.test(after.listString)) problems.push("numer elementu");
       const earlier = state.items.slice(0, Math.max(state.index, 0));
       if (earlier.some(x => now.get(x.id)?.listString !== x.listString)) problems.push("wcześniejsze elementy listy");
+      if (plan.method === "start_override") {
+        // The previewed run shifts by value - 1 in whichever Office.js list it lies;
+        // every other later item (other definitions, deeper levels, items after an
+        // existing restart) keeps its number.
+        const shift = state.value - 1, at = state.all.findIndex(x => x.id === payload.paragraph_id);
+        if (state.all.slice(at + 1).some(x => now.get(x.id)?.value !== (run.has(x.id) ? x.value - shift : x.value)))
+          problems.push("dalsze elementy listy");
+        const renamed = state.sequence.map(([id, text]) => [id === payload.paragraph_id ? target : id, text]);
+        if (JSON.stringify(after.sequence) !== JSON.stringify(renamed)) problems.push("układ akapitów");
+      }
+      if (plan.method === "start_override") {
+        if (shapeOf(committed.value, state.level, current.text) !== restart.package.shape) problems.push("właściwości akapitu zmieniły się w chwili zapisu");
+        const exported = after.paragraph.getRange("Whole").getOoxml();
+        await ctx.sync();
+        problems.push(...restartOutcome(committed.value, exported.value, state.level, DOMParser, current.text, restart.package.hidden));
+      }
     }
     if (others.some(x => now.get(x.id)?.text !== x.text)) problems.push("tekst innych elementów");
     // Items of other lists keep their numbers whatever the operation.
-    if (state.all.some(x => x.list !== state.id && now.get(x.id)?.listString !== x.listString)) problems.push("numeracja innych list");
+    if (state.all.some(x => x.list !== state.id && !run.has(x.id) && now.get(x.id)?.listString !== x.listString)) problems.push("numeracja innych list");
   }
   if (problems.length) throw Error(`Weryfikacja listy nie powiodła się (${problems.join(", ")}). Sprawdź dokument (Ctrl+Z cofa zmianę).`);
-  return {ok: true, operation: plan.operation, paragraph_id: payload.paragraph_id, level: after.level,
+  return {ok: true, operation: plan.operation, method: plan.method ?? null, paragraph_id: target,
+    ...(target !== payload.paragraph_id ? {previous_paragraph_id: payload.paragraph_id, note: "Akapit ma nowe paragraph_id; ponów snapshot."} : {}), level: after.level,
     level_type: after.levelTypes[after.level], list_string: after.listString, list_value: after.value,
     list_item_count: after.items.length};
 }

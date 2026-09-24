@@ -352,11 +352,14 @@ async function execute(command, expected, gen) {
       status("Zmiana wykonana w ramach udzielonego dostępu do dokumentu.");
     }
   } catch (error) {
+    // unchanged: Word rejected the write and a fresh read matched the preview,
+    // so the bridge records a failure instead of blocking the session.
+    const unchanged = submitted && error.unchanged === true;
     if (started && session === expected && generation === gen) {
-      await api("result", {command_id: command.command_id, result: {ok: false, submitted, error: error.message,
+      await api("result", {command_id: command.command_id, result: {ok: false, submitted, unchanged, error: error.message,
         api: error.debugInfo?.errorLocation || null}}, expected, gen).catch(() => {});
     }
-    if (generation === gen) status(`${error.message}${submitted ? " Wynik może być niepewny — nie ponawiaj zapisu automatycznie." : ""}`);
+    if (generation === gen) status(`${error.message}${submitted && !unchanged ? " Wynik może być niepewny — nie ponawiaj zapisu automatycznie." : ""}`);
   }
 }
 

@@ -192,7 +192,10 @@ Podgląd nie zmienia dokumentu. Oprócz hasha akapitu zwraca `guard_sha256`, czy
 otoczenia (sąsiedzi, lista, tabela albo cała sekcja). Mostek przyjmuje podgląd tylko
 z tym odciskiem i przekazuje go do zapisu. Zapis wylicza wszystko od nowa i odmawia,
 gdy odcisk się różni. Po zapisie panel sprawdza wynik; niezgodność po wysłanej mutacji
-daje `unknown` (Ctrl+Z w Wordzie cofa zmianę; nie ponawiać automatycznie).
+daje `unknown` (Ctrl+Z w Wordzie cofa zmianę; nie ponawiać automatycznie). Wyjątek: gdy
+Word odrzuci zapis operacji na liście, a świeży odczyt po błędzie pokaże stan identyczny
+z podglądem (ten sam odcisk, numery wszystkich elementów list i układ akapitów), wynik to
+`failed` z `result.unchanged=true`; sesja nie jest blokowana.
 
 Przez `word_session_preview` (pole `text` jest parametrem, jak przy `set_style`):
 
@@ -215,13 +218,16 @@ Przez `word_session_preview` (pole `text` jest parametrem, jak przy `set_style`)
 - `list_type` (`text="bullet"|"number"`): typ poziomu elementu w całej liście
   (`setLevelBullet` Solid albo `setLevelNumbering` Arabic „1.”). Podgląd podaje liczbę
   elementów objętych zmianą; kontrola sprawdza, że inne listy się nie zmieniły.
-- `list_restart` (`text=""`): numeracja od 1 od tego elementu. Pierwszy element poziomu:
-  `setLevelStartingNumber(level, 1)`. Element w środku listy (poziom 0): `separateList()`,
-  które wymaga WordApiDesktop 1.4 (Word M365 2508+); starszy Word dostaje czytelną odmowę.
-  `startNewList()` nie nadaje się, bo nie działa na istniejącym elemencie listy.
-  Kontrola wymaga odczytu wartości numeru (`listFormat.listValue`, WordApiDesktop 1.3);
-  bez niego podgląd odmawia, zamiast kończyć poprawny zapis stanem `unknown`. Każda
-  operacja na liście sprawdza też, że numeracja innych list się nie zmieniła.
+- `list_restart` (`text=""`): numeracja od 1 od tego elementu; podgląd podaje `method`.
+  Poziom 0 (także pierwszy element listy): `start_override`, czyli to samo co „Uruchom ponownie
+  od 1” w Wordzie (szczegóły w sekcji „Restart numeracji listy”). Pierwszy element głębszego
+  poziomu: `set_starting_number` (`setLevelStartingNumber(level, 1)`), tylko gdy jego numer
+  wynika z wartości początkowej poziomu (inaczej odmowa); środek listy na głębszym poziomie jest
+  odrzucany. `separateList()` nie jest używane. Podgląd odmawia z powodem, gdy
+  restartu nie da się wykonać bezpiecznie (np. element kończy sekcję Worda, leży w tabeli, ma
+  śledzoną zmianę właściwości). Kontrola wymaga odczytu wartości numeru (`listFormat.listValue`,
+  WordApiDesktop 1.3); bez niego podgląd odmawia, zamiast kończyć poprawny zapis stanem
+  `unknown`. Każda operacja na liście sprawdza też, że numeracja innych list się nie zmieniła.
   Numeracja nagłówków (styl Heading) jest blokowana: służy do tego `set_style`.
   Operacje na listach obsługują listy w treści głównej (nie w nagłówkach i przypisach).
 
@@ -302,6 +308,135 @@ listy oraz trzy przeniesienia sekcji (także z obrazem i tabelą). Po poprawce o
 w nowej paczce `Word.run` dodanie wiersza zwróciło `succeeded` i oczekiwaną liczbę
 wierszy; wstawienie pustego akapitu również zwróciło `succeeded`. Zapisany DOCX
 potwierdził obie zmiany. Spis treści pozostał bez odświeżenia pól.
+
+## Restart numeracji listy (2026-09-24)
+
+Zgłoszenie z 2026-09-23 (Word M365, dokument z SharePoint): `list_restart` na pierwszym
+elemencie 9.1 przeszedł podgląd (`separate_list`, `current_value=8`), a zapis skończył się
+„Microsoft Word: This command is not available.” (`Paragraph.separateList`), stanem
+`unknown` i blokadą sesji, choć dokument się nie zmienił. Ten sam błąd dawało COM
+(`SeparateList`, `ApplyListTemplateWithLevel`); `SeparateList` na pierwszym elemencie 9.2
+działało, a `ExecuteMso("NumberingRestart")` działało na 9.1.
+
+Przyczyna, odtworzona `scripts/check_secure_list_restart_com.py` (osobna niewidoczna instancja
+Worda, dokumenty syntetyczne): Word numeruje według definicji listy (`w:abstractNum`), a nie
+według jej wystąpienia (`w:num`). Dokumenty składane z części mają kilka wystąpień tej samej
+definicji; numeracja ciągnie się przez nie (1–7, 8–11, 12–14). `SeparateList` odmawia dokładnie
+na pierwszym w dokumencie akapicie wystąpienia, które kontynuuje wcześniejsze. Nie ma znaczenia
+nagłówek, tabela, odległość, styl List Number ani numeracja bezpośrednia. Tam, gdzie działa,
+dzieli tylko akapity tego samego wystąpienia, więc przy kilku wystąpieniach dalsze bloki
+numeruje inaczej niż „od 1”. Przewidzenie odmowy wymagałoby eksportu wszystkich wcześniejszych
+elementów listy, dlatego dodatek nie używa już `separateList`.
+
+Metoda `start_override` robi to co „Uruchom ponownie od 1”: Word dodaje jedno wystąpienie
+`w:num` tej samej definicji z `w:lvlOverride/w:startOverride=1` i zmienia `w:numPr` tylko tego
+akapitu; dalsze elementy liczą 2, 3… Panel eksportuje akapit zakresem Whole (eksport Content nie
+zawiera `w:pPr`; Office.js dokleja do eksportu Whole pusty akapit, który panel pomija po
+sprawdzeniu tekstu). Buduje paczkę z pustym akapitem niosącym właściwości elementu z nowym
+`w:numPr`, pustym wartownikiem i sklonowanym `w:num` ze `startOverride`, i wstawia ją
+`getRange("Content").insertOoxml(paczka, "End")`. Office.js zachowuje znacznik akapitu docelowego
+dla ostatniego wstawionego akapitu (odbiór na żywo), więc bez wartownika właściwości przepadają.
+Z wartownikiem tekst elementu kończy się znacznikiem z paczki w nowym akapicie, a dawny znacznik
+i dawne `paragraph_id` zostają na pustym akapicie tuż za nim. Panel sprawdza dokładnie ten
+kształt (reszta układu bez zmian) i w drugim batchu, po ponownym sprawdzeniu dostępu, usuwa ten
+pusty akapit; w tym samym batchu przed usunięciem odczytuje jego tekst i obrazy, więc treść wpisana
+w międzyczasie daje błąd weryfikacji i `unknown` zamiast cichej utraty. Tekst, przebiegi, zakładki, komentarze i pola elementu nie są przepisywane, ale
+element ma **nowe `paragraph_id`**; wynik podaje je w `paragraph_id` (dawne w
+`previous_paragraph_id`). Definicję z paczki Word łączy z istniejącą po `w:nsid`.
+
+Import OOXML (inaczej niż polecenie Worda) nie dodaje wystąpienia identycznego z istniejącym,
+tylko podpina akapit pod istniejące: bez obsługi drugi restart w tej samej liście nic by nie
+zmienił, a restart przed istniejącym restartem by go usunął (COM, przegląd kodu). Nowe
+wystąpienie dostaje więc neutralny `lvlOverride` innego poziomu. W listach wielopoziomowych
+jest to zdefiniowany poziom ze startem równym jego własnemu (widoczny w eksporcie). W listach
+jednopoziomowych (np. List Number) jest to poziom niezdefiniowany z unikalną wartością startu:
+Word go zachowuje i uwzględnia przy imporcie, ale nie eksportuje; taki poziom nie ma elementów,
+więc numeracja się nie zmienia (COM oraz Office.js na żywo: kolejny restart w liście z już
+istniejącym restartem dostał nowe wystąpienie). Odcisk podglądu obejmuje właściwości akapitu,
+jego treść, definicję listy i wszystkie jej wystąpienia z eksportu Whole.
+
+Podgląd odmawia z powodem, gdy: element kończy sekcję Worda (`w:sectPr`), ma śledzoną zmianę
+w `w:pPr`, leży w kontrolce zawartości albo w tabeli (eksport Whole ostatniego akapitu komórki
+obejmuje cały wiersz, a wstawienie w komórce nie zostało sprawdzone), eksport ma nieoczekiwaną
+strukturę lub nie odpowiada tekstowi akapitu (powód zawiera liczby: akapity, przebiegi, długość
+tekstu, bez treści), definicja listy nie ma `w:nsid`, poziom z OOXML różni się od poziomu listy,
+albo element ma już numer 1. Odmowa proponuje „Uruchom ponownie od 1” w Wordzie lub uzgodniony
+fallback COM. Podgląd odmawia też, gdy wystąpienie listy elementu ma własną wartość początkową
+(np. z „Ustaw wartość numeracji”), a dalsze akapity używają tego wystąpienia: Word stosuje ją przy
+pierwszym akapicie wystąpienia, więc po przeniesieniu elementu przeszłaby na następny element.
+
+Office.js grupuje elementy w listy według wystąpienia, a Word liczy według definicji, więc restart
+przesuwa także późniejsze listy Office.js tej samej definicji (np. restart Requirement 3 przesuwa
+9.1 i 9.2). Panel eksportuje więc jednym zakresem akapity od elementu do ostatniego elementu listy
+w dokumencie, przypisuje akapity numerowane do elementów list z Office.js (liczba musi się
+zgadzać) i wyznacza przebieg: dalsze elementy tej samej definicji (po `w:nsid`) i poziomu, których
+numery kontynuują numer elementu, do pierwszego płytszego elementu albo istniejącego restartu.
+`renumbered_item_count` obejmuje cały przebieg; etykiety elementów podrzędnych z numerem nadrzędnym
+(np. 9.1) zmienią się razem z nim. Przebieg i numery jego elementów wchodzą do odcisku podglądu.
+
+Paczka niesie `w:pPr` elementu, którego nie widzi hash zakresu Content. Dlatego tuż przed
+zapisem panel ponownie eksportuje zakres Whole i odmawia (stale), gdy odcisk się różni,
+a w tej samej paczce co `insertOoxml` eksportuje go jeszcze raz: zmiana w chwili zapisu daje
+błąd weryfikacji „właściwości akapitu zmieniły się w chwili zapisu” i `unknown`.
+
+Kontrola po zapisie: element (pod nowym ID) ma numer 1 i ten sam tekst; wcześniejsze elementy
+bez zmian; elementy przebiegu (w dowolnej liście Office.js) przesunięte o `current_value - 1`;
+wszystkie pozostałe dalsze elementy (inne definicje, głębsze poziomy, elementy za istniejącym
+restartem) bez zmian; układ
+akapitów (ID i tekst) jak przed zapisem poza nowym ID elementu; eksport Whole elementu z tą samą
+treścią i właściwościami poza `w:numPr`, które wskazuje nowe wystąpienie tej samej definicji
+(`w:nsid`) ze `startOverride=1`, różne od każdego wcześniejszego (gdy odróżnia je tylko ukryty
+override, rozstrzyga kontrola numerów); numeracja innych list bez zmian.
+
+Klasyfikacja błędu (wszystkie operacje na listach): gdy zapis rzuci wyjątek, panel robi świeży
+odczyt. Stan identyczny z podglądem (ten sam `guard_sha256` z nowym hashem akapitu, te same
+teksty, poziomy i numery wszystkich elementów list, przy `list_restart` także ich wartości
+`listValue`, ten sam układ akapitów) daje
+`failed` z `unchanged=true` i komunikatem „Word odrzucił zmianę listy… dokument się nie
+zmienił”. Mostek nie blokuje wtedy sesji. Gdy odczyt się nie uda albo cokolwiek się różni,
+zostaje `unknown`; błąd po pierwszym batchu (np. przy usuwaniu pustego akapitu) jest zawsze
+`unknown`. Mostek uznaje tylko dosłowne `unchanged: true`.
+
+Przegląd kodu (trzy rundy, recenzenci z weryfikacją adwersarialną) znalazł m.in. scalanie
+identycznych wystąpień przy imporcie, przebieg między listami Office.js, przekazanie własnej
+wartości początkowej wystąpienia, nieskuteczne `setLevelStartingNumber` dla kontynuowanych numerów
+i wyścig przy usuwaniu pustego akapitu; wszystkie potwierdzone zgłoszenia poprawiono i pokryto
+testami.
+
+Walidacja COM (`scripts/check_secure_list_restart_com.py`): macierz dostępności `SeparateList`
+dla 7 układów (numeracja ze stylu, bezpośrednia, wielopoziomowa, drugie wystąpienie jedno-
+i wielopoziomowe, przeplot, akapit z komentarzem/zakładką/polem) oraz sekwencje restartów
+wykonywane tak jak w dodatku. Każda numeruje zgodnie z podglądem i nie zmienia innych akapitów,
+stylów, zakładek, komentarzy, pól ani definicji list; w listach jednopoziomowych wynik jest
+identyczny z `NumberingRestart`. W listach wielopoziomowych z kilkoma wystąpieniami własne
+„Uruchom ponownie od 1” Worda potrafi skopiować definicję listy; dalsze bloki liczą wtedy według
+starej (np. po a7 = 3 następuje b1 = 3). Metoda panelu zachowuje definicję, więc dalsze elementy
+liczą od restartu, zgodnie z podglądem.
+
+Odbiór na żywo (Word M365, dodatek Office.js, 2026-09-24) pokazał trzy rzeczy, których COM nie
+ujawnił: Office.js grupuje elementy w listy według wystąpienia `w:num` (w dokumencie testowym
+„Plan step A” był pierwszym elementem swojej listy, choć miał numer 8; w zgłoszeniu z 2026-09-23
+Office.js pokazał 14 elementów w jednej liście, więc grupowanie zależy od budowy dokumentu), stara
+ścieżka `set_starting_number` nie zmienia takiego numeru (zapis zakończony `unknown`, dokument
+bez zmian), a eksport Whole i wstawianie OOXML działają inaczej niż w COM (dodatkowy pusty akapit;
+właściwości ostatniego wstawionego akapitu odrzucone). Stąd: `start_override` dla każdego
+elementu poziomu 0, tolerancja eksportu i przepływ z wartownikiem. Warianty sprawdzono w panelu
+przez WebView2 DevTools na kopii dokumentu testowego (Word uruchomiony z lokalnym portem
+debugowania tylko na czas testu, potem zamknięty).
+
+Końcowy odbiór na żywo (świeży dokument z `make_list_restart_live_test_doc.py`, sterowanie przez
+MCP): „Closing item X” odrzucony w podglądzie („akapit kończy sekcję Worda”); restart Requirement 3
+(`renumbered_item_count=14`) dał 1, 2, 1–5 oraz przesunął dalsze listy tej samej definicji (9.1:
+6–9, 9.2: 10–12, 9.4: 13–14); restart „Plan step A” dał 1–4 (9.2: 5–7, 9.4: 8–9); restart „Risk A”
+dał 1–3 (9.4: 4–5); niezależna lista przez cały czas 1–3; ponowny restart „Plan step A” odrzucony
+jako no-op. Każdy zapis zakończył się `succeeded` z nowym `paragraph_id`. W odzyskanym dokumencie
+(„AutoRecovered”), w którym Word odrzucał każdy zapis (także `insertText`), wynik to `failed`
+z `unchanged=true` bez blokady sesji. Testy: 113 JavaScript i 39 Python PASS; skrypt COM 0 porażek.
+
+Dokument do odbioru na żywo tworzy `scripts/make_list_restart_live_test_doc.py`: lista 1–7,
+przerwa z nagłówkami i tabelą, 9.1 (8–11) jako drugie wystąpienie tej samej definicji, 9.2
+(12–14), niezależna lista 1–3 oraz 9.4 (15–16), gdzie pierwszy element kończy sekcję. Skrypt
+sprawdza, że Word odmawia `SeparateList` na pierwszym elemencie 9.1.
 
 ## Kontrakt i zabezpieczenia
 

@@ -10,6 +10,33 @@ const PKG = "http://schemas.microsoft.com/office/2006/xmlPackage";
 const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 const pXml = r => `<w:p><w:pPr><w:pStyle w:val="${r.style}"/></w:pPr>${r.fieldEnd ? '<w:r><w:fldChar w:fldCharType="end"/></w:r>' : ""}${r.bookmark ? `<w:bookmarkStart w:id="9" w:name="${r.bookmark}"/><w:bookmarkEnd w:id="9"/>` : ""}${r.text ? `<w:r><w:t xml:space="preserve">${esc(r.text)}</w:t></w:r>` : ""}</w:p>`;
 const single = r => `<w:document xmlns:w="${W}"><w:body>${pXml(r)}</w:body></w:document>`;
+// Word's list model as observed through COM: one counter per list definition
+// (w:abstractNum, "abstract" here) on level 0; each paragraph selects a numbering
+// instance (w:num); an instance's startOverride applies at its first paragraph,
+// which also starts a new Word/Office.js list.
+const numOf = r => String(r.list.num ?? r.list.id);
+const abstractOf = r => String(r.list.abstract ?? r.list.id);
+// Exports use integer ids and one nsid per definition, like Word.
+const idOf = (state, map, key) => (state[map][key] ??= Object.keys(state[map]).length + 1);
+function numberingXml(state, abstracts) {
+  const levels = state.multiLevel ? 9 : 1;
+  let xml = "";
+  for (const a of abstracts) xml += `<w:abstractNum w:abstractNumId="${idOf(state, "abstractIds", a)}"><w:nsid w:val="0000AB${String(idOf(state, "abstractIds", a)).padStart(2, "0")}"/>` +
+    Array.from({length: levels}, (_, l) => `<w:lvl w:ilvl="${l}"><w:start w:val="1"/></w:lvl>`).join("") + "</w:abstractNum>";
+  const nums = [...new Map(state.rows.filter(r => r.list && abstracts.includes(abstractOf(r))).map(r => [numOf(r), abstractOf(r)])).entries()];
+  for (const [num, a] of nums) xml += `<w:num w:numId="${idOf(state, "numIds", num)}" xmlns:w16cid="http://schemas.microsoft.com/office/word/2016/wordml/cid" w16cid:durableId="7${idOf(state, "numIds", num)}"><w:abstractNumId w:val="${idOf(state, "abstractIds", a)}"/>` +
+    Object.entries(state.numOverrides[num] || {}).filter(([l]) => Number(l) < levels).map(([l, v]) => `<w:lvlOverride w:ilvl="${l}"><w:startOverride w:val="${v}"/></w:lvlOverride>`).join("") + "</w:num>";
+  return `<pkg:part pkg:name="/word/numbering.xml"><pkg:xmlData><w:numbering xmlns:w="${W}">${xml}</w:numbering></pkg:xmlData></pkg:part>`;
+}
+const listParagraphXml = (state, r) => !r.list ? pXml(r) :
+  `<w:p><w:pPr><w:pStyle w:val="${r.style}"/><w:numPr><w:ilvl w:val="${r.list.level}"/><w:numId w:val="${idOf(state, "numIds", numOf(r))}"/></w:numPr>${r.sectionBreak ? "<w:sectPr/>" : ""}</w:pPr>${r.text ? `<w:r><w:t xml:space="preserve">${esc(r.text)}</w:t></w:r>` : ""}</w:p>`;
+// Whole export of paragraphs [first..last]: w:pPr with w:numPr and every instance of their definitions.
+function wholeXml(state, rows) {
+  const abstracts = [...new Set(rows.filter(r => r.list).map(abstractOf))];
+  // Office.js adds an empty paragraph to Whole exports (live Word 2026-09-24).
+  const trailing = state.trailingExportParagraph ? '<w:p><w:pPr><w:pStyle w:val="Normal"/></w:pPr></w:p>' : "";
+  return `<pkg:package xmlns:pkg="${PKG}"><pkg:part pkg:name="/word/document.xml"><pkg:xmlData><w:document xmlns:w="${W}"><w:body>${rows.map(r => listParagraphXml(state, r)).join("")}${trailing}<w:sectPr/></w:body></w:document></pkg:xmlData></pkg:part>${numberingXml(state, abstracts)}</pkg:package>`;
+}
 function flat(records) {
   let body = "", i = 0;
   while (i < records.length) {
@@ -33,6 +60,88 @@ async function boot(rows, options = {}) {
   for (const [name, [from, to]] of Object.entries(options.bookmarks || {}))
     state.bookmarks.set(name, {start: state.rows.find(r => r.id === from), end: state.rows.find(r => r.id === to)});
   state.bookmarkText = name => { const m = state.bookmarks.get(name); return m && state.rows.slice(state.rows.indexOf(m.start), state.rows.indexOf(m.end) + 1).map(r => r.text).join("\r"); };
+  state.separateCalls = 0;
+  Object.assign(state, {multiLevel: Boolean(options.multiLevel), trailingExportParagraph: options.trailingExportParagraph ?? true, numOverrides: {}, numList: {}, abstractStart: {}, abstractIds: {}, numIds: {}, wholeExports: 0});
+  for (const r of state.rows) if (r.list) {
+    // Definition and instance stay when Word moves an item to another list.
+    r.list.abstract ??= String(r.list.id);
+    r.list.num = String(r.list.num ?? r.list.id);
+    state.numList[numOf(r)] ??= r.list.id;
+    if (r.list.override != null) state.numOverrides[numOf(r)] ??= {0: r.list.override};
+  }
+  let nextList = 100;
+  const renumber = abstract => {
+    const members = state.rows.filter(r => r.list && abstractOf(r) === abstract);
+    if (!members.length) return;
+    const firsts = new Set(), seen = new Set();
+    for (const r of members) if (!seen.has(numOf(r))) { seen.add(numOf(r)); firsts.add(r); }
+    let counter = (state.abstractStart[abstract] ?? members[0].list.value) - 1;
+    for (const r of members) {
+      const override = state.numOverrides[numOf(r)]?.[0];
+      if (firsts.has(r) && override != null) counter = override - 1;
+      // Office.js groups list items by numbering instance (live Word 2026-09-24).
+      const list = state.numList[numOf(r)] ??= nextList++;
+      state.lists[list] ??= [...state.lists[r.list.id]];
+      r.list.id = list;
+      if (r.list.level !== 0) continue;
+      counter++;
+      r.list.value = counter; r.list.string = `${counter}.`;
+    }
+  };
+  // insertOoxml of the restart package at the end of an item's content (live
+  // Word, Office.js): the last inserted paragraph keeps the item's mark, so a
+  // package without a sentinel changes nothing; with one, the item's runs end
+  // with the package's mark in a new paragraph and the former mark and ID stay on
+  // an empty paragraph after it. The package's definition merges by nsid; an
+  // instance with the same overrides of that definition is reused.
+  const restartThroughOoxml = (rec, xml, location) => {
+    if (location !== "End") throw Error(`unexpected insert location ${location}`);
+    if (options.ooxmlRefused) {
+      if (options.rereadFails) state.rereadFails = true;
+      throw Object.assign(Error("Microsoft Word: This command is not available."), {debugInfo: {errorLocation: "Range.insertOoxml"}});
+    }
+    state.writes++;
+    const doc = new DOMParser().parseFromString(xml, "application/xml");
+    const paragraphs = Array.from(doc.getElementsByTagNameNS(W, "body")[0].getElementsByTagNameNS(W, "p"));
+    if (!paragraphs.length || paragraphs.some(p => p.getElementsByTagNameNS(W, "r").length)) throw Error("package must hold empty paragraphs");
+    if (paragraphs.length === 1) return;  // the only paragraph merges into the item's mark: its properties are dropped
+    const numId = paragraphs[0].getElementsByTagNameNS(W, "numId")[0].getAttributeNS(W, "val");
+    const num = Array.from(doc.getElementsByTagNameNS(W, "num")).find(n => n.getAttributeNS(W, "numId") === numId);
+    const nsid = Array.from(doc.getElementsByTagNameNS(W, "abstractNum")).find(a => a.getAttributeNS(W, "abstractNumId") ===
+      num.getElementsByTagNameNS(W, "abstractNumId")[0].getAttributeNS(W, "val")).getElementsByTagNameNS(W, "nsid")[0].getAttributeNS(W, "val");
+    if (nsid !== `0000AB${String(state.abstractIds[abstractOf(rec)]).padStart(2, "0")}`) throw Error("package lost the list definition");
+    const overrides = Object.fromEntries(Array.from(num.getElementsByTagNameNS(W, "lvlOverride")).map(o =>
+      [o.getAttributeNS(W, "ilvl"), Number(o.getElementsByTagNameNS(W, "startOverride")[0].getAttributeNS(W, "val"))]));
+    // Failures in the middle of Word's batch.
+    const partial = () => { throw Error("GeneralException"); };
+    if (options.ooxmlPartial) { rec.list.value = overrides[0]; rec.list.string = `${overrides[0]}.`; partial(); }
+    if (options.extraThrow) { state.rows.splice(index(rec) + 1, 0, {id: `new-${state.next++}`, text: "", style: "Normal", tableNestingLevel: 0}); partial(); }
+    if (options.propertiesThrow) { rec.list.num = `p${state.next++}`; partial(); }  // another instance, same numbers
+    if (options.numbersThrow) { state.rows.find(r => r.list && abstractOf(r) !== abstractOf(rec)).list.string = "9."; partial(); }
+    if (options.ooxmlExtraParagraph) state.rows.splice(index(rec) + 1, 0, {id: `new-${state.next++}`, text: "", style: rec.style, tableNestingLevel: 0});
+    const abstract = abstractOf(rec);
+    const key = JSON.stringify(Object.entries(overrides).sort());
+    const same = Object.keys(state.numOverrides).find(n => JSON.stringify(Object.entries(state.numOverrides[n]).sort()) === key &&
+      state.rows.some(r => r.list && numOf(r) === n && abstractOf(r) === abstract));
+    const target = same ?? `r${state.next++}`;
+    if (!same) state.numOverrides[target] = overrides;
+    const text = {id: `${rec.id}~${state.next++}`, text: rec.text, style: rec.style, tableNestingLevel: rec.tableNestingLevel, list: {...rec.list, num: target}};
+    if (options.splitKeepsId) {  // not what Word does: the ID stays with the text
+      state.rows.splice(index(rec) + 1, 0, {...text, text: "", list: {...rec.list}});
+      rec.list = text.list;
+      renumber(abstract);
+      return;
+    }
+    state.rows.splice(index(rec), 0, text);
+    rec.text = "";
+    // Someone types into the empty paragraph before the executor removes it.
+    if (options.typeIntoEmpty) state.onIdentity = () => { rec.text = "typed meanwhile"; state.onIdentity = null; };
+    if (options.ooxmlNoContinue) {  // a separate definition: later items keep counting the old one
+      text.list.abstract = `x${state.next++}`;
+      renumber(text.list.abstract);
+    }
+    renumber(abstract);
+  };
   const proxies = new WeakMap();
   const tableProxies = new WeakMap();
   const index = rec => state.rows.indexOf(rec);
@@ -51,7 +160,9 @@ async function boot(rows, options = {}) {
     parentContentControlOrNullObject: nul(),
     get listFormat() { return {load() {}, get listValue() { return a.list?.value ?? null; }}; },
     getOoxml() {
-      if (options.exportFails) throw Error("export");
+      if (options.exportFails || state.rereadFails) throw Error("export");
+      if (kind === "spanWhole") return {value: wholeXml(state, state.rows.slice(index(a), index(b) + 1))};
+      if (kind === "Whole" && a.list && ++state.wholeExports === options.mutateOnWholeExport) a.list.num = `m${state.next++}`;
       if (kind === "span" && ++state.spanExports === 2 && options.editAfterExport) {
         const value = flat(state.rows.slice(index(a), index(b)));
         a.text += " (co-author)";  // typed while the apply export is being hashed
@@ -59,9 +170,12 @@ async function boot(rows, options = {}) {
       }
       return {value: kind === "span" ? flat(state.rows.slice(index(a), index(b))) : kind === "table"
         ? `<w:document xmlns:w="${W}"><w:body><w:tbl>${a.table.rows.map(r => `<w:tr>${r.map(c => `<w:tc><w:p><w:r><w:t>${c}</w:t></w:r></w:p></w:tc>`).join("")}</w:tr>`).join("")}</w:tbl></w:body></w:document>`
-        : single(a)};
+        : kind === "Whole" && a.list ? wholeXml(state, [a]) : single(a)};
     },
-    expandTo(other) { return other.kind === "End" ? range("anchor", a, other.a) : range("span", a, other.a); },
+    expandTo(other) {
+      if (kind === "Whole" && other.kind === "Whole") return range("spanWhole", a, other.a);
+      return other.kind === "End" ? range("anchor", a, other.a) : range("span", a, other.a);
+    },
     compareLocationWith(other) {
       const at = index(a), start = index(other.a), end = index(other.b);
       if (kind === "bookmark") return {value: at >= start && index(b) < end ? "Inside" : "OverlapsBefore"};
@@ -81,7 +195,8 @@ async function boot(rows, options = {}) {
       if (a.text.includes(text)) (a.matches ??= []).push(match);
       return {items: a.text.includes(text) ? [match] : [], load() {}};
     },
-    insertOoxml(xml) {
+    insertOoxml(xml, location) {
+      if (kind === "Content") return restartThroughOoxml(a, xml, location);
       state.writes++;
       const doc = new DOMParser().parseFromString(xml, "application/xml");
       const body = doc.getElementsByTagNameNS(W, "body")[0];
@@ -132,14 +247,13 @@ async function boot(rows, options = {}) {
         return {isNullObject: false, load() {}, get id() { return rec.list.id; }, get levelTypes() { return state.lists[rec.list.id]; },
           setLevelBullet(level) { state.writes++; state.lists[rec.list.id][level] = "Bullet"; },
           setLevelNumbering(level) { state.writes++; state.lists[rec.list.id][level] = "Number"; },
-          setLevelStartingNumber() { state.writes++; members().forEach((r, i) => { r.list.value = i + 1; r.list.string = `${i + 1}.`; }); }};
+          setLevelStartingNumber(level, start) { state.writes++; state.abstractStart[abstractOf(rec)] = start; renumber(abstractOf(rec)); }};
       },
+      // The add-in no longer calls separateList: Word refuses it on the first
+      // paragraph of a numbering instance ("This command is not available.").
       separateList() {
-        state.writes++;
-        const members = state.rows.filter(r => r.list?.id === rec.list.id);
-        const tail = members.slice(members.indexOf(rec));
-        state.lists[99] = [...state.lists[rec.list.id]];
-        tail.forEach((r, i) => { r.list = {...r.list, id: 99, value: i + 1, string: `${i + 1}.`}; });
+        state.separateCalls++;
+        throw Object.assign(Error("Microsoft Word: This command is not available."), {debugInfo: {errorLocation: "Paragraph.separateList"}});
       },
        get parentTableOrNullObject() {
          if (!rec.table) return nul();
@@ -158,7 +272,12 @@ async function boot(rows, options = {}) {
          return tableProxy;
       },
       get parentTableCell() { return {load() {}, rowIndex: rec.row}; },
-      delete() { state.writes++; if (!options.brokenDelete) state.rows.splice(index(rec), 1); },
+      delete() {
+        state.writes++;
+        if (options.brokenDelete) return;
+        state.rows.splice(index(rec), 1);
+        if (rec.list) renumber(abstractOf(rec));  // Word renumbers the list at once
+      },
     };
     proxies.set(rec, proxy);
     return proxy;
@@ -171,7 +290,7 @@ async function boot(rows, options = {}) {
   globalThis.window = {setInterval: fn => { state.tick = fn; }};
   globalThis.Office = {AsyncResultStatus: {Succeeded: "ok"}, HostType: {Word: "Word"}, onReady: fn => fn({host: "Word"}),
     context: {requirements: {isSetSupported: (name, version) => name === "WordApi" || (name === "WordApiDesktop" && Number(version) <= state.desktop)},
-      document: {getFilePropertiesAsync: cb => cb({status: "ok", value: {url: "https://test/doc.docx"}})}}};
+      document: {getFilePropertiesAsync: cb => { state.onIdentity?.(); cb({status: "ok", value: {url: "https://test/doc.docx"}}); }}}};
   const ctx = {sync: async () => {}, document: {
     load() {}, changeTrackingMode: "Off",
     getParagraphByUniqueLocalId: id => paragraph(state.rows.find(r => r.id === id)),
@@ -286,16 +405,207 @@ test("list_level and list_restart change only the addressed item", async () => {
   const level = await s.run({operation: "list_level", paragraph_id: "i3", expected_sha256: await s.hash("i3"), text: "1", find: ""});
   assert.equal(level.applied.ok, true, JSON.stringify(level.applied)); assert.equal(s.rows[2].list.level, 1);
   const restart = await s.run({operation: "list_restart", paragraph_id: "i2", expected_sha256: await s.hash("i2"), text: "", find: ""});
-  assert.equal(restart.preview.method, "separate_list");
+  assert.equal(restart.preview.method, "start_override");
   assert.equal(restart.applied.ok, true, JSON.stringify(restart.applied)); assert.equal(restart.applied.list_value, 1);
   assert.equal(s.rows[0].list.string, "4.", "earlier item keeps its number");
+  assert.equal(s.rows[2].list.value, 6, "a deeper item keeps its number");
+  assert.equal(s.separateCalls, 0);
 });
 
-test("list_restart mid-list requires WordApiDesktop 1.4", async () => {
-  const s = await boot([{id: "i1", text: "one", list: {id: 1, level: 0, string: "1.", value: 1}},
-    {id: "i2", text: "two", list: {id: 1, level: 0, string: "2.", value: 2}}, {id: "end", text: ""}], {lists: {1: ["Number"]}, desktop: 1.3});
-  const {preview} = await s.run({operation: "list_restart", paragraph_id: "i2", expected_sha256: await s.hash("i2"), text: "", find: ""});
-  assert.equal(preview.ok, false); assert.match(preview.error, /WordApiDesktop 1.4/); assert.equal(s.writes, 0);
+// The same layout as live Word showed it on the synthetic document: Office.js
+// groups by numbering instance, so 9.1's first item is the first item of its list
+// although it reads 8.
+const perInstance = () => continued().map(r => r.list?.num === 2 ? {...r, list: {...r.list, id: 7, abstract: "1"}} : r);
+
+// The layout observed 2026-09-23: 1-7, a long gap with headings and a table, then
+// 9.1 (8-11) and 9.2 (12-14). 9.1 starts its own numbering instance (num 2) of
+// the same list definition, so Word refuses Paragraph.separateList there.
+const continued = () => [
+  {id: "h7", text: "7.1 Functional", style: "Heading 2"},
+  ...[1, 2, 3, 4, 5, 6, 7].map(n => ({id: `a${n}`, text: `first ${n}`, style: "List Number", list: {id: 1, level: 0, string: `${n}.`, value: n}})),
+  {id: "h8", text: "8 Design", style: "Heading 1"}, {id: "gap", text: "Gap paragraph."},
+  {id: "cell", text: "cell", tableNestingLevel: 1}, {id: "h9", text: "9.1 Plan", style: "Heading 2"},
+  ...[8, 9, 10, 11].map(n => ({id: `b${n}`, text: `second ${n}`, style: "List Number", list: {id: 1, level: 0, string: `${n}.`, value: n, num: 2}})),
+  {id: "h92", text: "9.2 Risks", style: "Heading 2"},
+  ...[12, 13, 14].map(n => ({id: `c${n}`, text: `third ${n}`, style: "List Number", list: {id: 1, level: 0, string: `${n}.`, value: n, num: 2}})),
+  {id: "o1", text: "other one", list: {id: 5, level: 0, string: "1.", value: 1}}, {id: "o2", text: "other two", list: {id: 5, level: 0, string: "2.", value: 2}},
+  {id: "end", text: ""}];
+const LISTS = {lists: {1: ["Number"], 5: ["Number"]}};
+const restartAt = async (s, id) => s.run({operation: "list_restart", paragraph_id: id, expected_sha256: await s.hash(id), text: "", find: ""});
+const numbers = (s, pattern) => s.rows.filter(r => pattern.test(r.id) && r.list).map(r => r.list.value);
+
+test("list_restart on the first item of a continued block restarts at 1 like Word's Restart at 1, without separateList", async () => {
+  const s = await boot(continued(), {...LISTS, desktop: 1.3});
+  const {preview, applied} = await restartAt(s, "b8");
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.equal(preview.method, "start_override"); assert.equal(preview.current_value, 8);
+  assert.equal(preview.renumbered_item_count, 7); assert.equal(preview.list_item_count, 14);
+  assert.equal(applied.ok, true, JSON.stringify(applied)); assert.equal(applied.method, "start_override");
+  assert.deepEqual(numbers(s, /^a\d/), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(numbers(s, /^[bc]\d/), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(numbers(s, /^o\d/), [1, 2], "the other list is untouched");
+  // Office.js moves the item's text into a new paragraph; its former ID and mark go with the removed empty paragraph.
+  assert.equal(applied.previous_paragraph_id, "b8"); assert.equal(s.rows.some(r => r.id === "b8"), false);
+  const item = s.rows.find(r => r.id === applied.paragraph_id);
+  assert.equal(item.text, "second 8"); assert.equal(s.rows.length, continued().length);
+  assert.notEqual(item.list.id, 1, "the restarted item has its own instance");
+  assert.equal(s.separateCalls, 0); assert.equal(s.writes, 2, "insertion and removal of the empty paragraph");
+});
+
+test("the first item of an Office.js list that continues an earlier instance restarts through a new instance", async () => {
+  const s = await boot(perInstance(), {lists: {1: ["Number"], 5: ["Number"], 7: ["Number"]}});
+  const {preview, applied} = await restartAt(s, "b8");
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.equal(preview.list_item_count, 7); assert.equal(preview.first_item, "second 8");
+  assert.equal(preview.method, "start_override", "setLevelStartingNumber could not change a continued number");
+  assert.equal(applied.ok, true, JSON.stringify(applied));
+  assert.deepEqual(numbers(s, /^a\d/), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(numbers(s, /^[bc]\d/), [1, 2, 3, 4, 5, 6, 7]);
+});
+
+test("a restart renumbers later Office.js lists of the same definition and says so in the preview", async () => {
+  const s = await boot(perInstance(), {lists: {1: ["Number"], 5: ["Number"], 7: ["Number"]}});
+  const {preview, applied} = await restartAt(s, "a3");
+  assert.equal(preview.list_item_count, 7, "its own Office.js list"); assert.equal(preview.renumbered_item_count, 12);
+  assert.equal(applied.ok, true, JSON.stringify(applied));
+  assert.deepEqual(numbers(s, /^a\d/), [1, 2, 1, 2, 3, 4, 5]);
+  assert.deepEqual(numbers(s, /^[bc]\d/), [6, 7, 8, 9, 10, 11, 12]);
+  assert.deepEqual(numbers(s, /^o\d/), [1, 2]);
+  const order = await boot(perInstance(), {lists: {1: ["Number"], 5: ["Number"], 7: ["Number"]}});
+  for (const id of ["b8", "c12", "a3"]) assert.equal((await restartAt(order, id)).applied.ok, true, id);
+  assert.deepEqual(numbers(order, /^[abc]\d/), [1, 2, 1, 2, 3, 4, 5, 1, 2, 3, 4, 1, 2, 3]);
+});
+
+test("the first item of an instance with its own start value is refused: Word would hand that value on", async () => {
+  const rows = perInstance().map(r => r.list?.num === 2 ? {...r, list: {...r.list, value: r.list.value - 3, string: `${r.list.value - 3}.`, override: r.id === "b8" ? 5 : undefined}} : r);
+  const s = await boot(rows, {lists: {1: ["Number"], 5: ["Number"], 7: ["Number"]}});
+  const {preview} = await restartAt(s, "b8");
+  assert.equal(preview.ok, false); assert.match(preview.error, /własną wartość początkową \(5\).*Restart at 1/);
+  assert.equal(s.writes, 0);
+});
+
+test("a deeper-level number that continues an earlier item is refused instead of an ineffective setLevelStartingNumber", async () => {
+  const rows = [{id: "p1", text: "parent", list: {id: 1, level: 0, string: "1.", value: 1}},
+    {id: "s1", text: "sub one", list: {id: 8, abstract: "1", num: 8, level: 1, string: "c.", value: 3}},
+    {id: "s2", text: "sub two", list: {id: 8, abstract: "1", num: 8, level: 1, string: "d.", value: 4}}, {id: "end", text: ""}];
+  const s = await boot(rows, {lists: {1: ["Number", "Number"], 8: ["Number", "Number"]}, multiLevel: true});
+  const {preview} = await restartAt(s, "s1");
+  assert.equal(preview.ok, false); assert.match(preview.error, /kontynuuje wcześniejszy element/); assert.equal(s.writes, 0);
+});
+
+for (const [mode, problem, writes] of [["typeIntoEmpty", /pusty akapit zmienił się przed usunięciem/, 2], ["splitKeepsId", /układ akapitów po wstawieniu/, 1],
+  ["brokenDelete", /układ akapitów/, 2]]) {
+  test(`the removal of the empty paragraph never hides a surprise: ${mode}`, async () => {
+    const s = await boot(continued(), {...LISTS, [mode]: true});
+    const {applied} = await restartAt(s, "b8");
+    assert.equal(applied.ok, false); assert.equal(applied.submitted, true); assert.equal(applied.unchanged, false);
+    assert.match(applied.error, problem); assert.equal(s.writes, writes);
+    assert.ok(s.rows.some(r => r.text === "second 8"), "the item's text is never removed");
+  });
+}
+
+// Single-level definitions (List Number) cannot tell a second restart instance
+// apart by a visible override; a unique override of an undefined level does.
+for (const [order, expected] of [[["b8", "c12"], [1, 2, 3, 4, 1, 2, 3]], [["c12", "b8"], [1, 2, 3, 4, 1, 2, 3]],
+  [["a3", "a5"], null], [["a4", "a2"], null], [["b8", "c12", "b10"], [1, 2, 1, 2, 1, 2, 3]]]) {
+  test(`restarts ${order.join(" then ")} in a single-level list each get their own instance`, async () => {
+    const s = await boot(continued(), LISTS);
+    for (const id of order) {
+      const {preview, applied} = await restartAt(s, id);
+      assert.equal(preview.method, "start_override", id);
+      assert.equal(applied.ok, true, `${id}: ${JSON.stringify(applied)}`);
+    }
+    const values = numbers(s, /^[abc]\d/);
+    if (expected) assert.deepEqual(numbers(s, /^[bc]\d/), expected);
+    else if (order[0] === "a3") assert.deepEqual(values.slice(0, 7), [1, 2, 1, 2, 1, 2, 3], "a5 restarts, a3's restart stays");
+    else assert.deepEqual(values.slice(0, 7), [1, 1, 2, 1, 2, 3, 4], "a2 restarts before a4's restart, which stays");
+    assert.deepEqual(numbers(s, /^o\d/), [1, 2]);
+    assert.equal(s.separateCalls, 0);
+  });
+}
+
+test("multi-level lists keep every restart a new instance through a neutral deeper-level override", async () => {
+  const s = await boot(continued(), {...LISTS, multiLevel: true});
+  for (const id of ["b8", "c12", "b10"]) {
+    const {preview, applied} = await restartAt(s, id);
+    assert.equal(preview.method, "start_override", id);
+    assert.equal(applied.ok, true, `${id}: ${JSON.stringify(applied)}`);
+  }
+  assert.deepEqual(numbers(s, /^[bc]\d/), [1, 2, 1, 2, 1, 2, 3]);
+  assert.deepEqual(numbers(s, /^a\d/), [1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(s.separateCalls, 0);
+});
+
+test("a Word refusal whose fresh read matches the preview is reported as unchanged (bridge: failed, not unknown)", async () => {
+  const s = await boot(continued(), {...LISTS, ooxmlRefused: true});
+  const {preview, applied} = await restartAt(s, "b8");
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.equal(applied.ok, false); assert.equal(applied.submitted, true); assert.equal(applied.unchanged, true);
+  assert.match(applied.error, /This command is not available\..*nie zmienił/); assert.equal(applied.api, "Range.insertOoxml");
+  assert.equal(s.rows.find(r => r.id === "b8").list.value, 8);
+});
+
+// Each case changes the document in a way only one of the post-error checks can see.
+for (const [mode, seen] of [["ooxmlPartial", "item number"], ["extraThrow", "paragraph sequence"], ["propertiesThrow", "restart shape in the guard"],
+  ["numbersThrow", "numbers of other lists"], ["rereadFails", "failed re-read"]]) {
+  test(`a Word error stays an unknown outcome when the ${seen} differs`, async () => {
+    const s = await boot(continued(), {...LISTS, [mode]: true, ooxmlRefused: mode === "rereadFails"});
+    const {applied} = await restartAt(s, "b8");
+    assert.equal(applied.ok, false); assert.equal(applied.submitted, true); assert.equal(applied.unchanged, false, JSON.stringify(applied));
+  });
+}
+
+for (const [mode, problem] of [["ooxmlNoContinue", /dalsze elementy listy/], ["ooxmlExtraParagraph", /układ akapitów po wstawieniu/]]) {
+  test(`restart verification catches ${mode}`, async () => {
+    const s = await boot(continued(), {...LISTS, [mode]: true});
+    const {applied} = await restartAt(s, "b8");
+    assert.equal(applied.ok, false); assert.equal(applied.submitted, true); assert.equal(applied.unchanged, false);
+    assert.match(applied.error, problem); assert.match(applied.error, /Ctrl\+Z/);
+  });
+}
+
+test("paragraph properties changed after the preview or during the write never pass as verified", async () => {
+  const s = await boot(continued(), LISTS);
+  const payload = {operation: "list_restart", paragraph_id: "b8", expected_sha256: await s.hash("b8"), text: "", find: ""};
+  s.command = {command_id: "preview", type: "preview", payload}; await s.tick();
+  const preview = s.results.at(-1);
+  s.rows.find(r => r.id === "b8").list.num = "moved";  // another instance, same number: invisible to the Content hash
+  s.command = {command_id: "apply", type: "apply", payload: {...payload, guard_sha256: preview.guard_sha256}}; await s.tick();
+  assert.match(s.results.at(-1).error, /zmieniła się od podglądu/); assert.equal(s.writes, 0);
+  // Whole exports: preview, apply plan, pre-write check (3), same batch as the write (4).
+  const late = await boot(continued(), {...LISTS, mutateOnWholeExport: 3});
+  assert.match((await restartAt(late, "b8")).applied.error, /zmieniła się od podglądu/); assert.equal(late.writes, 0);
+  const racing = await boot(continued(), {...LISTS, mutateOnWholeExport: 4});
+  const raced = (await restartAt(racing, "b8")).applied;
+  assert.equal(raced.submitted, true); assert.match(raced.error, /zmieniły się w chwili zapisu/);
+});
+
+test("a restart stops shifting at an item that already restarts", async () => {
+  // c12 is a restarted instance (num 3, startOverride 1) of the same definition; Word gives it its own list.
+  const rows = continued();
+  for (const [i, r] of rows.filter(r => /^c\d/.test(r.id)).entries())
+    r.list = {...r.list, id: 6, abstract: "1", override: i ? undefined : 1, value: i + 1, string: `${i + 1}.`, num: 3};
+  for (const [multiLevel, method] of [[true, "start_override"], [false, "start_override"]]) {
+    const s = await boot(rows.map(r => ({...r, list: r.list && {...r.list}})), {lists: {1: ["Number"], 5: ["Number"], 6: ["Number"]}, multiLevel});
+    const {preview, applied} = await restartAt(s, "b9");
+    assert.equal(preview.method, method, `multiLevel ${multiLevel}`); assert.equal(preview.renumbered_item_count, 3);
+    assert.equal(applied.ok, true, JSON.stringify(applied));
+    assert.deepEqual(numbers(s, /^[bc]\d/), [8, 1, 2, 3, 1, 2, 3]);
+    assert.equal(s.rows.find(r => r.id === "c12").list.num, "3", "the existing restart is kept");
+  }
+});
+
+test("list_restart preview refuses what it cannot restart safely, before any write", async () => {
+  const rows = continued(); rows.find(r => r.id === "b8").sectionBreak = true;
+  rows.splice(rows.findIndex(r => r.id === "b10"), 0, {id: "t1", text: "in a cell", tableNestingLevel: 1, style: "List Number", list: {id: 1, level: 0, string: "10.", value: 10, num: 2}});
+  const s = await boot(rows, LISTS);
+  const blocked = await restartAt(s, "b8");
+  assert.equal(blocked.preview.ok, false); assert.match(blocked.preview.error, /kończy sekcję Worda.*Restart at 1/);
+  const cell = await restartAt(s, "t1");
+  assert.equal(cell.preview.ok, false); assert.match(cell.preview.error, /leży w tabeli/);
+  const first = await restartAt(s, "o1");
+  assert.equal(first.preview.ok, false); assert.match(first.preview.error, /już od 1/);
+  assert.equal(s.writes + s.separateCalls, 0);
 });
 
 test("insert_table_row adds one verified row after a data row", async () => {
